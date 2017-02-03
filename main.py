@@ -35,7 +35,9 @@ class TRPOAgent(object):
         self.config.max_pathlength = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps')
         print("Observation Space", env.observation_space)
         print("Action Space", env.action_space)
-        self.session = tf.Session()
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth=True # don't take full gpu memory
+        self.session = tf.Session(config=config)
         self.end_count = 0
         self.train = True
         self.obs = obs = tf.placeholder(
