@@ -23,6 +23,7 @@ def rollout(env, agent, max_pathlength, n_timesteps):
         ob = env.reset()
         agent.prev_action *= 0.0
         agent.prev_obs *= 0.0
+        terminated = False
         for _ in xrange(max_pathlength):
             action, action_dist, ob = agent.act(ob)
             obs.append(ob)
@@ -32,16 +33,27 @@ def rollout(env, agent, max_pathlength, n_timesteps):
             ob = res[0]
             rewards.append(res[1])
             if res[2]:
-                path = {"obs": np.concatenate(np.expand_dims(obs, 0)),
-                        "action_dists": np.concatenate(action_dists),
-                        "rewards": np.array(rewards),
-                        "actions": np.array(actions)}
-                paths.append(path)
-                agent.prev_action *= 0.0
-                agent.prev_obs *= 0.0
+                terminated = True
                 break
+
+
+        path = {"obs": np.concatenate(np.expand_dims(obs, 0)),
+                "action_dists": np.concatenate(action_dists),
+                "rewards": np.array(rewards),
+                "actions": np.array(actions),
+                "terminated": terminated,}
+        paths.append(path)
+        agent.prev_action *= 0.0
+        agent.prev_obs *= 0.0
         timesteps_sofar += len(path["rewards"])
     return paths
+
+def normalized_columns_initializer(std=1.0):
+    def _initializer(shape, dtype=None, partition_info=None):
+        out = np.random.randn(*shape).astype(np.float32)
+        out *= std / np.sqrt(np.square(out).sum(axis=0, keepdims=True))
+        return tf.constant(out)
+    return _initializer
 
 
 class VF(object):
@@ -55,15 +67,16 @@ class VF(object):
         print(shape)
         self.x = tf.placeholder(tf.float32, shape=[None, shape], name="x")
         self.y = tf.placeholder(tf.float32, shape=[None], name="y")
-        self.net = (pt.wrap(self.x).
-                    fully_connected(64, activation_fn=tf.nn.relu).
-                    fully_connected(64, activation_fn=tf.nn.relu).
-                    fully_connected(1))
+        self.net = self.x
+        hidden_sizes = [64,64]
+        for i in range(len(hidden_sizes)):
+            self.net = tf.nn.elu(linear(self.net, hidden_sizes[i], "vf/l{}".format(i), normalized_columns_initializer(0.01)))
+        self.net = linear(self.net, 1, "vf/value")
         self.net = tf.reshape(self.net, (-1, ))
         l2 = (self.net - self.y) * (self.net - self.y)
         self.train = tf.train.AdamOptimizer().minimize(l2)
-        self.session.run(tf.initialize_all_variables())
-        
+        self.session.run(tf.global_variables_initializer())
+
 
     def _features(self, path):
         o = path["obs"].astype('float32')
@@ -84,24 +97,56 @@ class VF(object):
 
     def predict(self, path):
         if self.net is None:
-            return np.zeros(len(path["rewards"])) 
+            return np.zeros(len(path["rewards"]))
         else:
             ret = self.session.run(self.net, {self.x: self._features(path)})
             return np.reshape(ret, (ret.shape[0], ))
 
 
-def cat_sample(prob_nk):
-    assert prob_nk.ndim == 2
-    N = prob_nk.shape[0]
-    csprob_nk = np.cumsum(prob_nk, axis=1)
-    out = np.zeros(N, dtype='i')
-    for (n, csprob_k, r) in zip(xrange(N), csprob_nk, np.random.rand(N)):
-        for (k, csprob) in enumerate(csprob_k):
-            if csprob > r:
-                out[n] = k
-                break
-    return out
+def linear(x, size, name, initializer=None, bias_init=0):
+    w = tf.get_variable(name + "/w", [x.get_shape()[1], size], initializer=initializer)
+    b = tf.get_variable(name + "/b", [size], initializer=tf.constant_initializer(bias_init))
+    return tf.matmul(x, w) + b
 
+def gaussian_sample(action_dist, action_size):
+    return np.random.randn(action_size) * action_dist[0,action_size:] + action_dist[0,:action_size]
+
+def deterministic_sample(action_dist, action_size):
+    return action_dist[0,:action_size]
+
+# returns mean and std of gaussian distribution
+def get_moments(action_dist, action_size):
+    mean = tf.reshape(action_dist[:, :action_size], [tf.shape(action_dist)[0], action_size])
+    std = (tf.reshape(action_dist[:, action_size:], [tf.shape(action_dist)[0], action_size]))
+    return mean, std
+
+def loglik(action, action_dist, action_size):
+    mean, std = get_moments(action_dist, action_size)
+    return -0.5 * tf.reduce_sum(tf.square((action-mean) / std),reduction_indices=-1) \
+            -0.5 * tf.log(2.0*np.pi)*action_size - tf.reduce_sum(tf.log(std),reduction_indices=-1)
+
+def kl_div(action_dist1, action_dist2, action_size):
+    mean1, std1 = get_moments(action_dist1, action_size)
+    mean2, std2 = get_moments(action_dist2, action_size)
+    numerator = tf.square(mean1 - mean2) + tf.square(std1) - tf.square(std2)
+    denominator = 2 * tf.square(std2) + 1e-8
+    return tf.reduce_sum(
+        numerator/denominator + tf.log(std2) - tf.log(std1),reduction_indices=-1)
+
+def entropy(action_dist, action_size):
+    _, std = get_moments(action_dist, action_size)
+    return tf.reduce_sum(tf.log(std),reduction_indices=-1) + .5 * np.log(2*np.pi*np.e) * action_size
+
+def create_policy_net(obs, hidden_sizes, action_size):
+    x = obs
+    for i in range(len(hidden_sizes)):
+        x = tf.nn.tanh(linear(x, hidden_sizes[i], "policy/l{}".format(i), normalized_columns_initializer(0.01)))
+    mean = linear(x, action_size, "policy/mean")
+    std_w = tf.Variable(tf.zeros([1,action_size]), name="policy/std/w")
+    #std_w = tf.get_variable("policy/std/w", [1, action_size], initializer=tf.zeros([1,action_size]))
+    std = tf.tile(tf.exp(std_w), tf.pack([tf.shape(mean)[0],1]))
+    output = tf.concat(1, [tf.reshape(mean, [-1, action_size]), tf.reshape(std, [-1, action_size])])
+    return output
 
 def var_shape(x):
     out = [k.value for k in x.get_shape()]
@@ -155,16 +200,6 @@ class GetFlat(object):
 
     def __call__(self):
         return self.op.eval(session=self.session)
-
-
-def slice_2d(x, inds0, inds1):
-    inds0 = tf.cast(inds0, tf.int64)
-    inds1 = tf.cast(inds1, tf.int64)
-    shape = tf.cast(tf.shape(x), tf.int64)
-    ncols = shape[1]
-    x_flat = tf.reshape(x, [-1])
-    return tf.gather(x_flat, inds0 * ncols + inds1)
-
 
 def linesearch(f, x, fullstep, expected_improve_rate):
     accept_ratio = .1

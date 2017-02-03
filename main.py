@@ -1,3 +1,5 @@
+import gym
+from normalized_env import NormalizedEnv
 from utils import *
 import numpy as np
 import random
@@ -5,9 +7,6 @@ import tensorflow as tf
 import time
 import os
 import logging
-import gym
-from gym import envs, scoreboard
-from gym.spaces import Discrete, Box
 import prettytensor as pt
 from space_conversion import SpaceConversionEnv
 import tempfile
@@ -15,19 +14,17 @@ import sys
 
 class TRPOAgent(object):
 
-    config = dict2(**{
-        "timesteps_per_batch": 1000,
-        "max_pathlength": 10000,
-        "max_kl": 0.01,
-        "cg_damping": 0.1,
-        "gamma": 0.95})
-
     def __init__(self, env):
         self.env = env
-        if not isinstance(env.observation_space, Box) or \
-           not isinstance(env.action_space, Discrete):
-            print("Incompatible spaces.")
-            exit(-1)
+
+        self.config = config = dict2(**{
+            "timesteps_per_batch": 1000,
+            "max_pathlength": env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps'),
+            "max_kl": 0.01,
+            "cg_damping": 0.1,
+            "gamma": 0.99,
+            "lam": 0.97,})
+
         print("Observation Space", env.observation_space)
         print("Action Space", env.action_space)
         self.session = tf.Session()
@@ -35,35 +32,35 @@ class TRPOAgent(object):
         self.train = True
         self.obs = obs = tf.placeholder(
             dtype, shape=[
-                None, 2 * env.observation_space.shape[0] + env.action_space.n], name="obs")
+                None, 2 * env.observation_space.shape[0] + env.action_space.shape[0]], name="obs")
         self.prev_obs = np.zeros((1, env.observation_space.shape[0]))
-        self.prev_action = np.zeros((1, env.action_space.n))
-        self.action = action = tf.placeholder(tf.int64, shape=[None], name="action")
+        self.prev_action = np.zeros((1, env.action_space.shape[0]))
+        self.action = action = tf.placeholder(dtype, shape=[None, env.action_space.shape[0]], name="action")
         self.advant = advant = tf.placeholder(dtype, shape=[None], name="advant")
-        self.oldaction_dist = oldaction_dist = tf.placeholder(dtype, shape=[None, env.action_space.n], name="oldaction_dist")
+        self.oldaction_dist = oldaction_dist = tf.placeholder(dtype, shape=[None, env.action_space.shape[0]*2], name="oldaction_dist")
 
+        # Create neural network
         # Create neural network.
-        action_dist_n, _ = (pt.wrap(self.obs).
-                            fully_connected(64, activation_fn=tf.nn.tanh).
-                            softmax_classifier(env.action_space.n))
+        action_dist_n = create_policy_net(self.obs, [64,64], env.action_space.shape[0])
+
         eps = 1e-6
         self.action_dist_n = action_dist_n
         N = tf.shape(obs)[0]
-        p_n = slice_2d(action_dist_n, tf.range(0, N), action)
-        oldp_n = slice_2d(oldaction_dist, tf.range(0, N), action)
-        ratio_n = p_n / oldp_n
         Nf = tf.cast(N, dtype)
+        logp_n = loglik(action, action_dist_n, env.action_space.shape[0])
+        oldlogp_n = loglik(action, oldaction_dist, env.action_space.shape[0])
+        ratio_n = tf.exp(logp_n - oldlogp_n) # Importance sampling ratio
         surr = -tf.reduce_mean(ratio_n * advant)  # Surrogate loss
         var_list = tf.trainable_variables()
-        kl = tf.reduce_sum(oldaction_dist * tf.log((oldaction_dist + eps) / (action_dist_n + eps))) / Nf
-        ent = tf.reduce_sum(-action_dist_n * tf.log(action_dist_n + eps)) / Nf
+        kl = tf.reduce_mean(kl_div(oldaction_dist, action_dist_n, env.action_space.shape[0]))
+        ent = tf.reduce_mean(entropy(action_dist_n, env.action_space.shape[0]))
 
         self.losses = [surr, kl, ent]
         self.pg = flatgrad(surr, var_list)
         # KL divergence where first arg is fixed
         # replace old->tf.stop_gradient from previous kl
-        kl_firstfixed = tf.reduce_sum(tf.stop_gradient(
-            action_dist_n) * tf.log(tf.stop_gradient(action_dist_n + eps) / (action_dist_n + eps))) / Nf
+        kl_firstfixed = tf.reduce_mean(kl_div(tf.stop_gradient(
+            action_dist_n), action_dist_n, env.action_space.shape[0]))
         grads = tf.gradients(kl_firstfixed, var_list)
         self.flat_tangent = tf.placeholder(dtype, shape=[None])
         shapes = map(var_shape, var_list)
@@ -79,21 +76,22 @@ class TRPOAgent(object):
         self.gf = GetFlat(self.session, var_list)
         self.sff = SetFromFlat(self.session, var_list)
         self.vf = VF(self.session)
-        self.session.run(tf.initialize_all_variables())
+        self.session.run(tf.global_variables_initializer())
 
     def act(self, obs, *args):
         obs = np.expand_dims(obs, 0)
-        self.prev_obs = obs
         obs_new = np.concatenate([obs, self.prev_obs, self.prev_action], 1)
 
         action_dist_n = self.session.run(self.action_dist_n, {self.obs: obs_new})
 
+        # TODO FIX
         if self.train:
-            action = int(cat_sample(action_dist_n)[0])
+            action = np.float32(gaussian_sample(action_dist_n, self.env.action_space.shape[0]))
         else:
-            action = int(np.argmax(action_dist_n))
-        self.prev_action *= 0.0
-        self.prev_action[0, action] = 1.0
+            action = np.float32(deterministic_sample(action_dist_n, self.env.action_space.shape[0]))
+
+        self.prev_action = np.expand_dims(np.copy(action),0)
+        self.prev_obs = obs
         return action, action_dist_n, np.squeeze(obs_new)
 
     def learn(self):
@@ -112,8 +110,11 @@ class TRPOAgent(object):
 
             # Computing returns and estimating advantage function.
             for path in paths:
-                path["baseline"] = self.vf.predict(path)
+                b = path["baseline"] = self.vf.predict(path)
                 path["returns"] = discount(path["rewards"], config.gamma)
+                b1 = np.append(b, 0 if path["terminated"] else b[-1])
+                deltas = path["rewards"] + config.gamma*b1[1:] - b1[:-1]
+                path["advant"] = discount(deltas, config.gamma * config.lam)
                 path["advant"] = path["returns"] - path["baseline"]
 
             # Updating policy.
@@ -189,8 +190,10 @@ class TRPOAgent(object):
                     print(k + ": " + " " * (40 - len(k)) + str(v))
                 if entropy != entropy:
                     exit(-1)
+                """
                 if exp > 0.8:
                     self.train = False
+                """
             i += 1
 
 training_dir = tempfile.mkdtemp()
@@ -199,17 +202,11 @@ logging.getLogger().setLevel(logging.DEBUG)
 if len(sys.argv) > 1:
     task = sys.argv[1]
 else:
-    task = "RepeatCopy-v0"
+    task = "Reacher-v1"
 
-env = envs.make(task)
-env.monitor.start(training_dir)
+env = gym.make(task)
 
-env = SpaceConversionEnv(env, Box, Discrete)
+env = NormalizedEnv(env, normalize_obs=True)
 
 agent = TRPOAgent(env)
 agent.learn()
-env.monitor.close()
-gym.upload(training_dir,
-           algorithm_id='trpo_ff')
-
-
