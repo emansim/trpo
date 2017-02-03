@@ -11,20 +11,28 @@ import prettytensor as pt
 from space_conversion import SpaceConversionEnv
 import tempfile
 import sys
+import argparse
+
+parser = argparse.ArgumentParser(description="Run commands")
+parser.add_argument('-e', '--env-id', type=str, default="Reacher-v1",
+                    help="Environment id")
+parser.add_argument('-tpb', '--timesteps-per-batch', default=1000, type=int,
+                    help="Minibatch size")
+parser.add_argument('-mkl', '--max-kl', default=0.01, type=float,
+                    help="Maximum value of KL divergence")
+parser.add_argument('-cgd', '--cg-damping', default=0.1, type=float,
+                    help="Conjugate gradient damping")
+parser.add_argument('-g', '--gamma', default=0.99, type=float,
+                    help="Discount Factor")
+parser.add_argument('-l', '--lam', default=0.97, type=float,
+                    help="Lambda value to reduce variance see GAE")
 
 class TRPOAgent(object):
 
-    def __init__(self, env):
+    def __init__(self, env, args):
         self.env = env
-
-        self.config = config = dict2(**{
-            "timesteps_per_batch": 1000,
-            "max_pathlength": env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps'),
-            "max_kl": 0.01,
-            "cg_damping": 0.1,
-            "gamma": 0.99,
-            "lam": 0.97,})
-
+        self.config = config = args
+        self.config.max_pathlength = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps')
         print("Observation Space", env.observation_space)
         print("Action Space", env.action_space)
         self.session = tf.Session()
@@ -142,7 +150,7 @@ class TRPOAgent(object):
                 [path["rewards"].sum() for path in paths])
 
             print "\n********** Iteration %i ************" % i
-            if episoderewards.mean() > 1.1 * self.env._env.spec.reward_threshold:
+            if episoderewards.mean() > 1.1 * self.env.spec.reward_threshold:
                 self.train = False
             if not self.train:
                 print("Episode mean: %f" % episoderewards.mean())
@@ -196,17 +204,12 @@ class TRPOAgent(object):
                 """
             i += 1
 
-training_dir = tempfile.mkdtemp()
-logging.getLogger().setLevel(logging.DEBUG)
+if __name__ == '__main__':
+    logging.getLogger().setLevel(logging.DEBUG)
 
-if len(sys.argv) > 1:
-    task = sys.argv[1]
-else:
-    task = "Reacher-v1"
+    args = parser.parse_args()
+    env = gym.make(args.env_id)
+    env = NormalizedEnv(env, normalize_obs=True)
 
-env = gym.make(task)
-
-env = NormalizedEnv(env, normalize_obs=True)
-
-agent = TRPOAgent(env)
-agent.learn()
+    agent = TRPOAgent(env, args)
+    agent.learn()
