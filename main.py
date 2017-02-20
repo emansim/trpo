@@ -7,7 +7,6 @@ import tensorflow as tf
 import time
 import os
 import logging
-import prettytensor as pt
 from space_conversion import SpaceConversionEnv
 import tempfile
 import sys
@@ -40,37 +39,54 @@ class TRPOAgent(object):
         self.session = tf.Session(config=config)
         self.end_count = 0
         self.train = True
+        self.hidden_dim = hidden_dim = env.action_space.shape[0]
         self.obs = obs = tf.placeholder(
             dtype, shape=[
                 None, 2 * env.observation_space.shape[0] + env.action_space.shape[0]], name="obs")
         self.prev_obs = np.zeros((1, env.observation_space.shape[0]))
         self.prev_action = np.zeros((1, env.action_space.shape[0]))
-        self.action = action = tf.placeholder(dtype, shape=[None, env.action_space.shape[0]], name="action")
+        self.hidden = hidden = tf.placeholder(dtype, shape=[None, hidden_dim], name="hidden")
         self.advant = advant = tf.placeholder(dtype, shape=[None], name="advant")
-        self.oldaction_dist = oldaction_dist = tf.placeholder(dtype, shape=[None, env.action_space.shape[0]*2], name="oldaction_dist")
+        self.oldhidden_dist = oldhidden_dist = tf.placeholder(dtype, shape=[None, hidden_dim*2], name="oldhidden_dist")
 
-        # Create neural network
-        # Create neural network.
-        action_dist_n = create_policy_net(self.obs, [64,64], env.action_space.shape[0])
+        # Create policy neural network
+        hidden_dist_n = create_policy_net(self.obs, [100,50,25,hidden_dim])
+        # Create action neural network
+        self.action_w = action_w = tf.get_variable("action/w", [hidden_dim, env.action_space.shape[0]])
+        self.action_b = action_b = tf.get_variable("action/b", [env.action_space.shape[0]], initializer=tf.constant_initializer(0))
+
+        action_determ = tf.matmul(tf.stop_gradient(get_moments(hidden_dist_n, hidden_dim)[0]), action_w) + action_b
+        self.hidden_ph = hidden_ph = tf.placeholder(dtype, shape=[None, hidden_dim], name="hidden_ph")
+        self.action_ph = tf.matmul(hidden_ph, action_w) + action_b
+        self.action = action = tf.placeholder(dtype, shape=[None, env.action_space.shape[0]], name="action")
+        self.action_net_dist = action_net_dist = -0.5 * tf.reduce_sum(tf.square((action_determ-action)),reduction_indices=-1)
+        self.action_net_loss = action_net_loss = -tf.reduce_mean(action_net_dist * advant)
+        action_net_grads = tf.gradients(action_net_loss, [self.action_w, self.action_b])
+        action_net_grads_and_vars = list(zip(action_net_grads, [self.action_w, self.action_b]))
+        self.action_net_train_op = tf.train.AdamOptimizer(1e-3).apply_gradients(action_net_grads_and_vars)
 
         eps = 1e-6
-        self.action_dist_n = action_dist_n
+        self.hidden_dist_n = hidden_dist_n
         N = tf.shape(obs)[0]
         Nf = tf.cast(N, dtype)
-        logp_n = loglik(action, action_dist_n, env.action_space.shape[0])
-        oldlogp_n = loglik(action, oldaction_dist, env.action_space.shape[0])
+        logp_n = loglik(hidden, hidden_dist_n, hidden_dim)
+        oldlogp_n = loglik(hidden, oldhidden_dist, hidden_dim)
         ratio_n = tf.exp(logp_n - oldlogp_n) # Importance sampling ratio
         surr = -tf.reduce_mean(ratio_n * advant)  # Surrogate loss
-        var_list = tf.trainable_variables()
-        kl = tf.reduce_mean(kl_div(oldaction_dist, action_dist_n, env.action_space.shape[0]))
-        ent = tf.reduce_mean(entropy(action_dist_n, env.action_space.shape[0]))
+        var_list_all = tf.trainable_variables() # remove action net vars
+        var_list = []
+        for var in var_list_all:
+            if not "action" in str(var.name):
+                var_list.append(var)
+        kl = tf.reduce_mean(kl_div(oldhidden_dist, hidden_dist_n, hidden_dim))
+        ent = tf.reduce_mean(entropy(hidden_dist_n, hidden_dim))
 
         self.losses = [surr, kl, ent]
         self.pg = flatgrad(surr, var_list)
         # KL divergence where first arg is fixed
         # replace old->tf.stop_gradient from previous kl
         kl_firstfixed = tf.reduce_mean(kl_div(tf.stop_gradient(
-            action_dist_n), action_dist_n, env.action_space.shape[0]))
+            hidden_dist_n), hidden_dist_n, hidden_dim))
         grads = tf.gradients(kl_firstfixed, var_list)
         self.flat_tangent = tf.placeholder(dtype, shape=[None])
         shapes = map(var_shape, var_list)
@@ -92,17 +108,19 @@ class TRPOAgent(object):
         obs = np.expand_dims(obs, 0)
         obs_new = np.concatenate([obs, self.prev_obs, self.prev_action], 1)
 
-        action_dist_n = self.session.run(self.action_dist_n, {self.obs: obs_new})
+        hidden_dist_n = self.session.run(self.hidden_dist_n, {self.obs: obs_new})
 
-        # TODO FIX
         if self.train:
-            action = np.float32(gaussian_sample(action_dist_n, self.env.action_space.shape[0]))
+            hidden = np.float32(gaussian_sample(hidden_dist_n, self.hidden_dim))
         else:
-            action = np.float32(deterministic_sample(action_dist_n, self.env.action_space.shape[0]))
+            hidden = np.float32(deterministic_sample(hidden_dist_n, self.hidden_dim))
+
+        action = self.session.run(self.action_ph, {self.hidden_ph: np.expand_dims(np.copy(hidden),0)})[0]
+        action = np.float32(action)
 
         self.prev_action = np.expand_dims(np.copy(action),0)
         self.prev_obs = obs
-        return action, action_dist_n, np.squeeze(obs_new)
+        return action, hidden, hidden_dist_n, np.squeeze(obs_new)
 
     def learn(self):
         config = self.config
@@ -128,9 +146,10 @@ class TRPOAgent(object):
                 path["advant"] = path["returns"] - path["baseline"]
 
             # Updating policy.
-            action_dist_n = np.concatenate([path["action_dists"] for path in paths])
+            hidden_dist_n = np.concatenate([path["hidden_dists"] for path in paths])
             obs_n = np.concatenate([path["obs"] for path in paths])
             action_n = np.concatenate([path["actions"] for path in paths])
+            hidden_n = np.concatenate([path["hiddens"] for path in paths])
             baseline_n = np.concatenate([path["baseline"] for path in paths])
             returns_n = np.concatenate([path["returns"] for path in paths])
 
@@ -143,10 +162,13 @@ class TRPOAgent(object):
             advant_n /= (advant_n.std() + 1e-8)
 
             feed = {self.obs: obs_n,
-                    self.action: action_n,
+                    self.hidden: hidden_n,
                 self.advant: advant_n,
-                    self.oldaction_dist: action_dist_n}
+                    self.oldhidden_dist: hidden_dist_n}
 
+            feed_action = {self.obs: obs_n,
+                    self.action: action_n,
+                    self.advant: advant_n}
 
             episoderewards = np.array(
                 [path["rewards"].sum() for path in paths])
@@ -160,7 +182,12 @@ class TRPOAgent(object):
                 if self.end_count > 100:
                     break
             if self.train:
+                # train value network
                 self.vf.fit(paths)
+                # train action network
+                for _ in range(4):
+                    _, action_net_loss = self.session.run([self.action_net_train_op, self.action_net_dist], feed_action)
+                # train policy network
                 thprev = self.gf()
 
                 def fisher_vector_product(p):
@@ -196,6 +223,7 @@ class TRPOAgent(object):
                 stats["Time elapsed"] = "%.2f mins" % ((time.time() - start_time) / 60.0)
                 stats["KL between old and new distribution"] = kloldnew
                 stats["Surrogate loss"] = surrafter
+                stats["Action Net loss"] = action_net_loss.mean()
                 for k, v in stats.iteritems():
                     print(k + ": " + " " * (40 - len(k)) + str(v))
                 if entropy != entropy:

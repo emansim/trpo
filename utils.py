@@ -2,7 +2,7 @@ import numpy as np
 import tensorflow as tf
 import random
 import scipy.signal
-import prettytensor as pt
+import sys
 
 seed = 1
 random.seed(seed)
@@ -19,16 +19,18 @@ def rollout(env, agent, max_pathlength, n_timesteps):
     paths = []
     timesteps_sofar = 0
     while timesteps_sofar < n_timesteps:
-        obs, actions, rewards, action_dists = [], [], [], []
+        obs, actions, rewards, hiddens, hidden_dists = [], [], [], [], []
         ob = env.reset()
         agent.prev_action *= 0.0
         agent.prev_obs *= 0.0
         terminated = False
         for _ in xrange(max_pathlength):
-            action, action_dist, ob = agent.act(ob)
+            action, hidden, hidden_dist, ob = agent.act(ob)
             obs.append(ob)
             actions.append(action)
-            action_dists.append(action_dist)
+            hiddens.append(hidden)
+            hidden_dists.append(hidden_dist)
+            #env.render()
             res = env.step(action)
             ob = res[0]
             rewards.append(res[1])
@@ -36,11 +38,11 @@ def rollout(env, agent, max_pathlength, n_timesteps):
                 terminated = True
                 break
 
-
         path = {"obs": np.concatenate(np.expand_dims(obs, 0)),
-                "action_dists": np.concatenate(action_dists),
+                "hidden_dists": np.concatenate(hidden_dists), # is it correct ?
                 "rewards": np.array(rewards),
                 "actions": np.array(actions),
+                "hiddens": np.array(hiddens),
                 "terminated": terminated,}
         paths.append(path)
         agent.prev_action *= 0.0
@@ -64,7 +66,7 @@ class VF(object):
         self.session = session
 
     def create_net(self, shape):
-        print(shape)
+        #print(shape)
         self.x = tf.placeholder(tf.float32, shape=[None, shape], name="x")
         self.y = tf.placeholder(tf.float32, shape=[None], name="y")
         self.net = self.x
@@ -81,10 +83,11 @@ class VF(object):
     def _features(self, path):
         o = path["obs"].astype('float32')
         o = o.reshape(o.shape[0], -1)
-        act = path["action_dists"].astype('float32')
+        hid = path["hidden_dists"].astype('float32')
+        act = path["actions"].astype('float32')
         l = len(path["rewards"])
         al = np.arange(l).reshape(-1, 1) / 10.0
-        ret = np.concatenate([o, act, al, np.ones((l, 1))], axis=1)
+        ret = np.concatenate([o, hid, act, al, np.ones((l, 1))], axis=1)
         return ret
 
     def fit(self, paths):
@@ -137,16 +140,32 @@ def entropy(action_dist, action_size):
     _, std = get_moments(action_dist, action_size)
     return tf.reduce_sum(tf.log(std),reduction_indices=-1) + .5 * np.log(2*np.pi*np.e) * action_size
 
-def create_policy_net(obs, hidden_sizes, action_size):
+def create_policy_net(obs, hidden_sizes):
+    x = obs
+    for i in range(len(hidden_sizes)-1):
+        x = tf.nn.tanh(linear(x, hidden_sizes[i], "policy/l{}".format(i), normalized_columns_initializer(0.01)))
+
+    x_mean = linear(x, hidden_sizes[-1], "policy/l{}/mean".format(len(hidden_sizes)-1), normalized_columns_initializer(0.01))
+    std_w = tf.Variable(tf.zeros([1,hidden_sizes[-1]]), name="policy/l{}/std".format(len(hidden_sizes)-1))
+    x_std = tf.tile(tf.exp(std_w), tf.pack([tf.shape(x_mean)[0],1]))
+    x = tf.concat(1, [tf.reshape(x_mean, [-1, hidden_sizes[-1]]), tf.reshape(x_std, [-1, hidden_sizes[-1]])])
+    return x
+
+"""
+def create_policy_net(obs, hidden_sizes, non_linear, action_size):
     x = obs
     for i in range(len(hidden_sizes)):
-        x = tf.nn.tanh(linear(x, hidden_sizes[i], "policy/l{}".format(i), normalized_columns_initializer(0.01)))
-    mean = linear(x, action_size, "policy/mean")
+        x = linear(x, hidden_sizes[i], "policy/l{}".format(i), normalized_columns_initializer(0.01))
+        #x = linear(x, hidden_sizes[i], "policy/l{}".format(i))
+        if non_linear[i]:
+            x = tf.nn.tanh(x)
+    mean = linear(x, action_size, "policy/mean", normalized_columns_initializer(0.01))
     std_w = tf.Variable(tf.zeros([1,action_size]), name="policy/std/w")
     #std_w = tf.get_variable("policy/std/w", [1, action_size], initializer=tf.zeros([1,action_size]))
     std = tf.tile(tf.exp(std_w), tf.pack([tf.shape(mean)[0],1]))
     output = tf.concat(1, [tf.reshape(mean, [-1, action_size]), tf.reshape(std, [-1, action_size])])
     return output
+"""
 
 def var_shape(x):
     out = [k.value for k in x.get_shape()]
