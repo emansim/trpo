@@ -7,7 +7,6 @@ import tensorflow as tf
 import time
 import os
 import logging
-import prettytensor as pt
 from space_conversion import SpaceConversionEnv
 import tempfile
 import sys
@@ -50,8 +49,7 @@ class TRPOAgent(object):
         self.oldaction_dist = oldaction_dist = tf.placeholder(dtype, shape=[None, env.action_space.shape[0]*2], name="oldaction_dist")
 
         # Create neural network
-        # Create neural network.
-        action_dist_n = create_policy_net(self.obs, [64,64], env.action_space.shape[0])
+        action_dist_n = create_policy_net(self.obs, [100,50,25], [True, True, True], env.action_space.shape[0])
 
         eps = 1e-6
         self.action_dist_n = action_dist_n
@@ -60,7 +58,8 @@ class TRPOAgent(object):
         logp_n = loglik(action, action_dist_n, env.action_space.shape[0])
         oldlogp_n = loglik(action, oldaction_dist, env.action_space.shape[0])
         ratio_n = tf.exp(logp_n - oldlogp_n) # Importance sampling ratio
-        surr = -tf.reduce_mean(ratio_n * advant)  # Surrogate loss
+        #surr = -tf.reduce_mean(ratio_n * advant)  # Surrogate loss
+        surr = -tf.reduce_mean(logp_n * advant) # Non-importance sampling based surr loss
         var_list = tf.trainable_variables()
         kl = tf.reduce_mean(kl_div(oldaction_dist, action_dist_n, env.action_space.shape[0]))
         ent = tf.reduce_mean(entropy(action_dist_n, env.action_space.shape[0]))

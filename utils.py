@@ -2,7 +2,7 @@ import numpy as np
 import tensorflow as tf
 import random
 import scipy.signal
-import prettytensor as pt
+import scipy.optimize
 
 seed = 1
 random.seed(seed)
@@ -64,19 +64,40 @@ class VF(object):
         self.session = session
 
     def create_net(self, shape):
-        print(shape)
         self.x = tf.placeholder(tf.float32, shape=[None, shape], name="x")
         self.y = tf.placeholder(tf.float32, shape=[None], name="y")
         self.net = self.x
-        hidden_sizes = [64,64]
+        hidden_sizes = [32,32]
         for i in range(len(hidden_sizes)):
             self.net = tf.nn.elu(linear(self.net, hidden_sizes[i], "vf/l{}".format(i), normalized_columns_initializer(0.01)))
         self.net = linear(self.net, 1, "vf/value")
         self.net = tf.reshape(self.net, (-1, ))
         l2 = (self.net - self.y) * (self.net - self.y)
-        self.train = tf.train.AdamOptimizer().minimize(l2)
+        var_list_all = tf.trainable_variables()
+        self.var_list = var_list = []
+        for var in var_list_all:
+            if "vf" in str(var.name):
+                var_list.append(var)
+        weight_decay = tf.add_n([1e-3 * tf.nn.l2_loss(var) for var in var_list])
+        self.loss = loss = l2+weight_decay
+        self.vfg = flatgrad(loss, var_list)
+        self.gf = GetFlat(self.session, var_list)
+        self.sff = SetFromFlat(self.session, var_list)
+        #self.train = tf.train.AdamOptimizer().minimize(l2)
+        #self.train = LbfgsOptimizer(l2+weight_decay, var_list, maxiter=25)
+
         self.session.run(tf.global_variables_initializer())
 
+    def update(self, *args):
+        featmat, returns = args[0], args[1]
+        thprev = self.gf()
+        def lossandgrad(th):
+            self.sff(th)
+            l,g = self.session.run([self.loss, self.vfg], {self.x: featmat, self.y: returns})
+            g = g.astype('float64')
+            return (l,g)
+        theta, _, opt_info = scipy.optimize.fmin_l_bfgs_b(lossandgrad, thprev, maxiter=25)
+        self.sff(theta)
 
     def _features(self, path):
         o = path["obs"].astype('float32')
@@ -92,8 +113,11 @@ class VF(object):
         if self.net is None:
             self.create_net(featmat.shape[1])
         returns = np.concatenate([path["returns"] for path in paths])
+        self.update(featmat, returns)
+        """
         for _ in range(50):
             self.session.run(self.train, {self.x: featmat, self.y: returns})
+        """
 
     def predict(self, path):
         if self.net is None:
@@ -137,10 +161,12 @@ def entropy(action_dist, action_size):
     _, std = get_moments(action_dist, action_size)
     return tf.reduce_sum(tf.log(std),reduction_indices=-1) + .5 * np.log(2*np.pi*np.e) * action_size
 
-def create_policy_net(obs, hidden_sizes, action_size):
+def create_policy_net(obs, hidden_sizes, nonlinear, action_size):
     x = obs
     for i in range(len(hidden_sizes)):
-        x = tf.nn.tanh(linear(x, hidden_sizes[i], "policy/l{}".format(i), normalized_columns_initializer(0.01)))
+        x = linear(x, hidden_sizes[i], "policy/l{}".format(i), normalized_columns_initializer(0.01))
+        if nonlinear[i]:
+            x = tf.nn.tanh(x)
     mean = linear(x, action_size, "policy/mean")
     std_w = tf.Variable(tf.zeros([1,action_size]), name="policy/std/w")
     #std_w = tf.get_variable("policy/std/w", [1, action_size], initializer=tf.zeros([1,action_size]))
