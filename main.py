@@ -11,6 +11,7 @@ from space_conversion import SpaceConversionEnv
 import tempfile
 import sys
 import argparse
+import scipy.optimize
 
 parser = argparse.ArgumentParser(description="Run commands")
 parser.add_argument('-e', '--env-id', type=str, default="Reacher-v1",
@@ -54,6 +55,7 @@ class TRPOAgent(object):
         # Create action neural network
         self.action_w = action_w = tf.get_variable("action/w", [hidden_dim, env.action_space.shape[0]])
         self.action_b = action_b = tf.get_variable("action/b", [env.action_space.shape[0]], initializer=tf.constant_initializer(0))
+        self.var_list_action = var_list_action = [self.action_w, self.action_b]
 
         action_determ = tf.matmul(tf.stop_gradient(get_moments(hidden_dist_n, hidden_dim)[0]), action_w) + action_b
         self.hidden_ph = hidden_ph = tf.placeholder(dtype, shape=[None, hidden_dim], name="hidden_ph")
@@ -61,9 +63,15 @@ class TRPOAgent(object):
         self.action = action = tf.placeholder(dtype, shape=[None, env.action_space.shape[0]], name="action")
         self.action_net_dist = action_net_dist = -0.5 * tf.reduce_sum(tf.square((action_determ-action)),reduction_indices=-1)
         self.action_net_loss = action_net_loss = -tf.reduce_mean(action_net_dist * advant)
+        self.action_net_grad = flatgrad(action_net_loss, var_list_action)
+        self.action_gf = GetFlat(self.session, var_list_action)
+        self.action_sff = SetFromFlat(self.session, var_list_action)
+
+        """
         action_net_grads = tf.gradients(action_net_loss, [self.action_w, self.action_b])
         action_net_grads_and_vars = list(zip(action_net_grads, [self.action_w, self.action_b]))
         self.action_net_train_op = tf.train.AdamOptimizer(1e-3).apply_gradients(action_net_grads_and_vars)
+        """
 
         eps = 1e-6
         self.hidden_dist_n = hidden_dist_n
@@ -103,6 +111,19 @@ class TRPOAgent(object):
         self.sff = SetFromFlat(self.session, var_list)
         self.vf = VF(self.session)
         self.session.run(tf.global_variables_initializer())
+
+    def update_action_net(self, feed_action):
+        thprev = self.action_gf()
+        def lossandgrad(th):
+            self.action_sff(th)
+            l,g = self.session.run([self.action_net_loss, self.action_net_grad], feed_action)
+            g = g.astype('float64')
+            l = -l
+            return (l,g)
+        theta, _, opt_info = scipy.optimize.fmin_l_bfgs_b(lossandgrad, thprev, maxiter=25)
+        self.action_sff(theta)
+        new_loss = self.session.run(self.action_net_loss, feed_action)
+        return np.asarray([new_loss])
 
     def act(self, obs, *args):
         obs = np.expand_dims(obs, 0)
@@ -185,8 +206,11 @@ class TRPOAgent(object):
                 # train value network
                 self.vf.fit(paths)
                 # train action network
+                """
                 for _ in range(4):
                     _, action_net_loss = self.session.run([self.action_net_train_op, self.action_net_dist], feed_action)
+                """
+                action_net_loss = self.update_action_net(feed_action)
                 # train policy network
                 thprev = self.gf()
 
