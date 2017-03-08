@@ -25,18 +25,29 @@ parser.add_argument('-g', '--gamma', default=0.99, type=float,
                     help="Discount Factor")
 parser.add_argument('-l', '--lam', default=0.97, type=float,
                     help="Lambda value to reduce variance see GAE")
+parser.add_argument('-s', '--seed', default=1, type=int,
+                    help="Seed")
+parser.add_argument('--log-dir', default="/tmp/trpo/", type=str,
+                    help="Folder to save")
 
 class TRPOAgent(object):
 
     def __init__(self, env, args):
         self.env = env
         self.config = config = args
-        self.config.max_pathlength = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps')
+        self.config.max_pathlength = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps') or 1000
+        # name of folder
+        folder_name = "trpo"
+        for key,value in vars(self.config).iteritems():
+            if key != 'log_dir':
+                folder_name = folder_name + "_{}_{}".format(key, value)
+            print key, value
+        self.config.log_dir = os.path.join(self.config.log_dir, self.config.env_id.split('-')[0], folder_name)
         print("Observation Space", env.observation_space)
         print("Action Space", env.action_space)
-        config = tf.ConfigProto()
-        config.gpu_options.allow_growth=True # don't take full gpu memory
-        self.session = tf.Session(config=config)
+        config_tf = tf.ConfigProto()
+        config_tf.gpu_options.allow_growth=True # don't take full gpu memory
+        self.session = tf.Session(config=config_tf)
         self.end_count = 0
         self.train = True
         self.obs = obs = tf.placeholder(
@@ -86,6 +97,7 @@ class TRPOAgent(object):
         self.sff = SetFromFlat(self.session, var_list)
         self.vf = VF(self.session)
         self.session.run(tf.global_variables_initializer())
+        self.summary_writer = tf.summary.FileWriter(self.config.log_dir)
 
     def act(self, obs, *args):
         obs = np.expand_dims(obs, 0)
@@ -195,8 +207,14 @@ class TRPOAgent(object):
                 stats["Time elapsed"] = "%.2f mins" % ((time.time() - start_time) / 60.0)
                 stats["KL between old and new distribution"] = kloldnew
                 stats["Surrogate loss"] = surrafter
+                summary = tf.Summary()
                 for k, v in stats.iteritems():
                     print(k + ": " + " " * (40 - len(k)) + str(v))
+                    if k != "Time elapsed":
+                        summary.value.add(tag=k, simple_value=float(v))
+                # save stats
+                self.summary_writer.add_summary(summary, i)
+                self.summary_writer.flush()
                 if entropy != entropy:
                     exit(-1)
                 """
@@ -209,6 +227,9 @@ if __name__ == '__main__':
     logging.getLogger().setLevel(logging.DEBUG)
 
     args = parser.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    tf.set_random_seed(args.seed)
     env = gym.make(args.env_id)
     env = NormalizedEnv(env, normalize_obs=True)
 

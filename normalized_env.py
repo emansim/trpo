@@ -9,6 +9,7 @@ class NormalizedEnv(Env):
   def __init__(self, env, scale_reward=1.0, normalize_obs=False, normalize_reward=False, obs_alpha=0.001, reward_alpha=0.001):
     self._env = env
     self.spec = self._env.spec
+    self.spec.reward_threshold = self.spec.reward_threshold or float('inf')
     self._scale_reward = scale_reward
     self._normalize_obs = normalize_obs
     self._normalize_reward = normalize_reward

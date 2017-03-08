@@ -4,11 +4,6 @@ import random
 import scipy.signal
 import scipy.optimize
 
-seed = 1
-random.seed(seed)
-np.random.seed(seed)
-tf.set_random_seed(seed)
-
 dtype = tf.float32
 
 def discount(x, gamma):
@@ -72,7 +67,7 @@ class VF(object):
             self.net = tf.nn.elu(linear(self.net, hidden_sizes[i], "vf/l{}".format(i), normalized_columns_initializer(0.01)))
         self.net = linear(self.net, 1, "vf/value")
         self.net = tf.reshape(self.net, (-1, ))
-        l2 = (self.net - self.y) * (self.net - self.y)
+        l2 = tf.reduce_mean((self.net - self.y) * (self.net - self.y))
         var_list_all = tf.trainable_variables()
         self.var_list = var_list = []
         for var in var_list_all:
