@@ -4,11 +4,6 @@ import random
 import scipy.signal
 import sys
 
-seed = 1
-random.seed(seed)
-np.random.seed(seed)
-tf.set_random_seed(seed)
-
 dtype = tf.float32
 
 def discount(x, gamma):
@@ -75,7 +70,7 @@ class VF(object):
             self.net = tf.nn.elu(linear(self.net, hidden_sizes[i], "vf/l{}".format(i), normalized_columns_initializer(0.01)))
         self.net = linear(self.net, 1, "vf/value")
         self.net = tf.reshape(self.net, (-1, ))
-        l2 = (self.net - self.y) * (self.net - self.y)
+        l2 = tf.reduce_mean((self.net - self.y) * (self.net - self.y))
         var_list_all = tf.trainable_variables()
         self.var_list = var_list = []
         for var in var_list_all:
@@ -165,6 +160,27 @@ def kl_div(action_dist1, action_dist2, action_size):
 def entropy(action_dist, action_size):
     _, std = get_moments(action_dist, action_size)
     return tf.reduce_sum(tf.log(std),reduction_indices=-1) + .5 * np.log(2*np.pi*np.e) * action_size
+
+def create_action_params(latent_dim, action_dim, hidden_sizes=[]):
+    hidden_sizes.insert(0, latent_dim)
+    hidden_sizes.insert(len(hidden_sizes), action_dim)
+    params = []
+    for i in range(len(hidden_sizes)-1):
+        w = tf.get_variable("action/w{}".format(i), [hidden_sizes[i], hidden_sizes[i+1]])
+        b = tf.get_variable("action/b{}".format(i), [hidden_sizes[i+1]], initializer=tf.constant_initializer(0))
+        params.append(w)
+        params.append(b)
+    return params
+
+def feedforward_action_net(x, params, non_linear):
+    num_layers = len(non_linear)
+    for i in range(num_layers):
+        w = params[2*i]
+        b = params[2*i + 1]
+        x = tf.matmul(x, w) + b
+        if non_linear[i]:
+            x = tf.nn.tanh(x)
+    return x
 
 def create_policy_net(obs, hidden_sizes):
     x = obs

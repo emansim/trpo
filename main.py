@@ -26,21 +26,41 @@ parser.add_argument('-g', '--gamma', default=0.99, type=float,
                     help="Discount Factor")
 parser.add_argument('-l', '--lam', default=0.97, type=float,
                     help="Lambda value to reduce variance see GAE")
+parser.add_argument('-s', '--seed', default=1, type=int,
+                    help="Seed")
+parser.add_argument('-hd', '--hidden-dim', default=-1, type=int,
+                    help="Latent dim")
+parser.add_argument('--action-net-hidden', default=[], nargs='+', type=int,
+                    help="Hidden sizes for action net")
+parser.add_argument('--action-net-nonlinear', default=[], nargs='+', type=int,
+                    help="Is it Nonlinear for action net ?")
+parser.add_argument('--log-dir', default="/tmp/latent-trpo/", type=str,
+                    help="Folder to save")
 
 class TRPOAgent(object):
 
     def __init__(self, env, args):
         self.env = env
         self.config = config = args
-        self.config.max_pathlength = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps')
+        self.config.max_pathlength = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps') or 1000
+        if self.config.hidden_dim == -1:
+            self.config.hidden_dim = self.env.action_space.shape[0]
+        # name of folder
+        folder_name = ""
+        for key,value in vars(self.config).iteritems():
+            if key != 'log_dir':
+                folder_name = folder_name + "_{}_{}".format(key, value)
+            print key, value
+        self.config.log_dir = os.path.join(self.config.log_dir, self.config.env_id.split('-')[0], folder_name)
+        print (self.config.log_dir)
         print("Observation Space", env.observation_space)
         print("Action Space", env.action_space)
-        config = tf.ConfigProto()
-        config.gpu_options.allow_growth=True # don't take full gpu memory
-        self.session = tf.Session(config=config)
+        config_tf = tf.ConfigProto()
+        config_tf.gpu_options.allow_growth=True # don't take full gpu memory
+        self.session = tf.Session(config=config_tf)
         self.end_count = 0
         self.train = True
-        self.hidden_dim = hidden_dim = env.action_space.shape[0]
+        self.hidden_dim = hidden_dim = self.config.hidden_dim
         self.obs = obs = tf.placeholder(
             dtype, shape=[
                 None, 2 * env.observation_space.shape[0] + env.action_space.shape[0]], name="obs")
@@ -53,13 +73,16 @@ class TRPOAgent(object):
         # Create policy neural network
         hidden_dist_n = create_policy_net(self.obs, [100,50,25,hidden_dim])
         # Create action neural network
-        self.action_w = action_w = tf.get_variable("action/w", [hidden_dim, env.action_space.shape[0]])
-        self.action_b = action_b = tf.get_variable("action/b", [env.action_space.shape[0]], initializer=tf.constant_initializer(0))
-        self.var_list_action = var_list_action = [self.action_w, self.action_b]
+        for i in range(len(self.config.action_net_nonlinear)):
+            self.config.action_net_nonlinear[i] = bool(self.config.action_net_nonlinear[i])
+        self.var_list_action = var_list_action = create_action_params(hidden_dim, env.action_space.shape[0], \
+                                                    self.config.action_net_hidden)
+        self.config.action_net_nonlinear.append(False) # last hidden layer to action is linear
 
-        action_determ = tf.matmul(tf.stop_gradient(get_moments(hidden_dist_n, hidden_dim)[0]), action_w) + action_b
+        action_determ = feedforward_action_net(tf.stop_gradient(get_moments(hidden_dist_n, hidden_dim)[0]),\
+                                                var_list_action, self.config.action_net_nonlinear)
         self.hidden_ph = hidden_ph = tf.placeholder(dtype, shape=[None, hidden_dim], name="hidden_ph")
-        self.action_ph = tf.matmul(hidden_ph, action_w) + action_b
+        self.action_ph = feedforward_action_net(hidden_ph, var_list_action, self.config.action_net_nonlinear)
         self.action = action = tf.placeholder(dtype, shape=[None, env.action_space.shape[0]], name="action")
         self.action_net_dist = action_net_dist = -0.5 * tf.reduce_sum(tf.square((action_determ-action)),reduction_indices=-1)
         self.action_net_loss = action_net_loss = -tf.reduce_mean(action_net_dist * advant)
@@ -111,6 +134,7 @@ class TRPOAgent(object):
         self.sff = SetFromFlat(self.session, var_list)
         self.vf = VF(self.session)
         self.session.run(tf.global_variables_initializer())
+        self.summary_writer = tf.summary.FileWriter(self.config.log_dir)
 
     def update_action_net(self, feed_action):
         thprev = self.action_gf()
@@ -248,8 +272,14 @@ class TRPOAgent(object):
                 stats["KL between old and new distribution"] = kloldnew
                 stats["Surrogate loss"] = surrafter
                 stats["Action Net loss"] = action_net_loss.mean()
+                summary = tf.Summary()
                 for k, v in stats.iteritems():
                     print(k + ": " + " " * (40 - len(k)) + str(v))
+                    if k != "Time elapsed":
+                        summary.value.add(tag=k, simple_value=float(v))
+                # save stats
+                self.summary_writer.add_summary(summary, i)
+                self.summary_writer.flush()
                 if entropy != entropy:
                     exit(-1)
                 """
@@ -262,6 +292,9 @@ if __name__ == '__main__':
     logging.getLogger().setLevel(logging.DEBUG)
 
     args = parser.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    tf.set_random_seed(args.seed)
     env = gym.make(args.env_id)
     env = NormalizedEnv(env, normalize_obs=True)
 
